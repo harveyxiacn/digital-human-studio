@@ -1,0 +1,33 @@
+# 引擎环境（engines/avatar_env，Python 3.10）。PyTorch 2.3.1+cu121 由 install.ps1 单独安装。
+numpy==1.26.4
+scipy==1.15.3
+opencv-python==4.10.0.84
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+pillow
+pyyaml
+tqdm
+rich
+tyro
+omegaconf==2.3.1
+einops==0.8.2
+safetensors==0.8.0
+huggingface_hub==0.36.2
+diffusers==0.32.2
+transformers==4.46.3
+accelerate==1.1.1
+librosa==0.11.0
+soundfile
+face-alignment==1.4.1
+insightface==0.7.3
+onnxruntime-gpu==1.18.1
+mediapipe==0.10.14
+scikit-image==0.25.2
+pykalman
+psutil
+# LatentSync
+decord==0.6.0
+DeepCache==0.1.1
+kornia==0.8.2
+python_speech_features==0.6
+ffmpeg-python==0.2.0

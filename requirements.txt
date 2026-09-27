@@ -1,0 +1,9 @@
+# 网页主程序（.venv，Python 3.11，不含 torch）
+gradio>=5.30,<6
+huggingface_hub
+psutil
+numpy
+pillow
+opencv-python-headless
+imageio-ffmpeg
+pyJianYingDraft==0.3.0

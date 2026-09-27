@@ -1,0 +1,12 @@
+# 环境与上游代码（由 install.ps1 安装/克隆）
+.venv/
+engines/avatar_env/
+engines/*_src/
+engines/bin/
+downloads/
+# 模型与个人数据（人脸、声音、生成的视频都只留在本机）
+models/
+workspace/
+outputs/
+__pycache__/
+*.pyc
