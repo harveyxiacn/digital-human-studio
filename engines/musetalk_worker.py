@@ -18,7 +18,7 @@ import queue
 import cv2
 import numpy as np
 
-from common import (MODELS, ENG_DIR, VideoWriter, face_landmarks, imread, imwrite, load_wav16k, progress, serve,
+from common import (MODELS, ENG_DIR, FaceTracker, VideoWriter, imread, imwrite, load_wav16k, progress, serve,
                     speech_weights)
 
 sys.path.insert(0, os.path.join(ENG_DIR, "musetalk_src"))
@@ -28,34 +28,65 @@ PREP_VERSION = 2
 _models = {}
 
 
-def _load():
-    if _models:
-        return _models
+def _load(full=True):
+    """预处理只需要 VAE 和人脸解析；UNet（3.4GB）和 Whisper 到生成口型时才加载。"""
     import torch
-    from diffusers import AutoencoderKL, UNet2DConditionModel
-    from transformers import WhisperModel
-    from musetalk.models.unet import PositionalEncoding
-    from musetalk.utils.audio_processor import AudioProcessor
-    from musetalk.utils.face_parsing import FaceParsing
-
-    progress(0.02, "加载 MuseTalk 模型…")
-    dev = torch.device("cuda")
-    with open(os.path.join(M, "musetalkV15", "musetalk.json"), encoding="utf-8") as f:
-        unet = UNet2DConditionModel(**json.load(f))
-    sd = torch.load(os.path.join(M, "musetalkV15", "unet.pth"), map_location="cpu")
-    unet.load_state_dict(sd)
-    del sd
-    unet = unet.half().to(dev).eval()
-    vae = AutoencoderKL.from_pretrained(os.path.join(M, "sd-vae")).half().to(dev).eval()
-    whisper = WhisperModel.from_pretrained(os.path.join(M, "whisper")).half().to(dev).eval()
-    ap = AudioProcessor(feature_extractor_path=os.path.join(M, "whisper"))
-    pe = PositionalEncoding(d_model=384).half().to(dev)
-
-    fp_dir = os.path.join(M, "face-parse-bisent")
-    FaceParsing.model_init.__defaults__ = (os.path.join(fp_dir, "resnet18-5c106cde.pth"),
-                                           os.path.join(fp_dir, "79999_iter.pth"))
-    _models.update(dev=dev, unet=unet, vae=vae, whisper=whisper, ap=ap, pe=pe, FaceParsing=FaceParsing)
+    if "vae" not in _models:
+        from diffusers import AutoencoderKL
+        from musetalk.utils.face_parsing import FaceParsing
+        progress(0.02, "加载模型…")
+        dev = torch.device("cuda")
+        vae = AutoencoderKL.from_pretrained(os.path.join(M, "sd-vae")).half().to(dev).eval()
+        fp_dir = os.path.join(M, "face-parse-bisent")
+        FaceParsing.model_init.__defaults__ = (os.path.join(fp_dir, "resnet18-5c106cde.pth"),
+                                               os.path.join(fp_dir, "79999_iter.pth"))
+        FaceParsing.__call__ = _face_parse
+        _models.update(dev=dev, vae=vae, FaceParsing=FaceParsing)
+    if full and "unet" not in _models:
+        from diffusers import UNet2DConditionModel
+        from transformers import WhisperModel
+        from musetalk.models.unet import PositionalEncoding
+        from musetalk.utils.audio_processor import AudioProcessor
+        progress(0.02, "加载 MuseTalk 模型…")
+        dev = _models["dev"]
+        with open(os.path.join(M, "musetalkV15", "musetalk.json"), encoding="utf-8") as f:
+            unet = UNet2DConditionModel(**json.load(f))
+        sd = torch.load(os.path.join(M, "musetalkV15", "unet.pth"), map_location="cpu")
+        unet.load_state_dict(sd)
+        del sd
+        _models.update(unet=unet.half().to(dev).eval(),
+                       whisper=WhisperModel.from_pretrained(os.path.join(M, "whisper")).half().to(dev).eval(),
+                       ap=AudioProcessor(feature_extractor_path=os.path.join(M, "whisper")),
+                       pe=PositionalEncoding(d_model=384).half().to(dev))
     return _models
+
+
+def _face_parse(self, image, size=(512, 512), mode="raw"):
+    """替换官方 FaceParsing.__call__：逻辑相同，只是把 19 类得分的 argmax 放在显卡上做。
+    官方先把 19×512×512 的浮点得分拷回内存再 argmax，实测占这一步 80% 的时间。"""
+    import torch
+    from PIL import Image
+    if isinstance(image, str):
+        image = Image.open(image)
+    with torch.no_grad():
+        img = self.preprocess(image.resize(size, Image.BILINEAR)).unsqueeze(0).cuda()
+        parsing = self.net(img)[0].squeeze(0).argmax(0).byte().cpu().numpy().astype(np.int64)
+    if mode == "neck":
+        parsing[np.isin(parsing, [1, 11, 12, 13, 14])] = 255
+        parsing[parsing != 255] = 0
+    elif mode == "jaw":
+        face_region = (np.isin(parsing, [1]) * 255).astype(np.uint8)
+        original_dilated = cv2.dilate(face_region, self.kernel, iterations=1)
+        eroded = cv2.erode(original_dilated, self.cheek_kernel, iterations=2)
+        face_region = cv2.bitwise_and(eroded, self.cheek_mask)
+        face_region = cv2.bitwise_or(face_region, cv2.bitwise_and(original_dilated, ~self.cheek_mask))
+        parsing[(face_region == 255) & (~np.isin(parsing, [10]))] = 255
+        parsing[np.isin(parsing, [11, 12, 13])] = 255
+        parsing[parsing != 255] = 0
+    else:
+        parsing[np.isin(parsing, [1, 11, 12, 13])] = 255
+        parsing[parsing != 255] = 0
+    return Image.fromarray(parsing.astype(np.uint8))
 
 
 # ---------------------------------------------------------------- 预处理
@@ -97,7 +128,7 @@ def prepare(video, out_dir, extra_margin=10, parsing_mode="jaw", left_cheek_widt
     import torch
     from PIL import Image
     from musetalk.utils.blending import get_image_prepare_material
-    m = _load()
+    m = _load(full=False)
     fp = m["FaceParsing"](left_cheek_width=left_cheek_width, right_cheek_width=right_cheek_width)
     frames_dir = os.path.join(out_dir, "frames")
     masks_dir = os.path.join(out_dir, "masks")
@@ -106,6 +137,7 @@ def prepare(video, out_dir, extra_margin=10, parsing_mode="jaw", left_cheek_widt
 
     cap = cv2.VideoCapture(video)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    track = FaceTracker()
     boxes, valid, opens, n = [], [], [], 0
     h = w = 0
     while True:
@@ -114,7 +146,7 @@ def prepare(video, out_dir, extra_margin=10, parsing_mode="jaw", left_cheek_widt
             break
         h, w = frame.shape[:2]
         imwrite(os.path.join(frames_dir, f"{n:06d}.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        lm, _ = face_landmarks(frame)
+        lm, _ = track(frame)
         if lm is None:
             boxes.append(np.zeros(4))
             valid.append(False)
@@ -136,25 +168,40 @@ def prepare(video, out_dir, extra_margin=10, parsing_mode="jaw", left_cheek_widt
     boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, h)
     boxes = boxes.round().astype(np.int32)
 
+    # 潜变量：每 4 帧一批做 VAE 编码；融合遮罩（人脸解析 + 大核模糊，主要耗 CPU）放到线程池里并行
+    from concurrent.futures import ThreadPoolExecutor
     vae, dev = m["vae"], m["dev"]
-    lat_list, crop_boxes = [], []
+    lat_list, crop_boxes = [], [None] * n
     mask_t = torch.zeros((256, 256))
     mask_t[:128] = 1
     norm = lambda x: (x - 0.5) / 0.5
-    for i in range(n):
-        frame = imread(os.path.join(frames_dir, f"{i:06d}.jpg"))
-        x1, y1, x2, y2 = boxes[i]
-        crop = cv2.resize(frame[y1:y2, x1:x2], (256, 256), interpolation=cv2.INTER_LANCZOS4)
-        rgb = torch.from_numpy(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).float().permute(2, 0, 1) / 255.0
-        batch = torch.stack([norm(rgb * mask_t), norm(rgb)]).to(dev).half()
-        with torch.no_grad():
-            lat = vae.encode(batch).latent_dist.sample() * vae.config.scaling_factor
-        lat_list.append(torch.cat([lat[0:1], lat[1:2]], dim=1).cpu())
+
+    def mask_job(i, frame):
         mask, crop_box = get_image_prepare_material(frame, [int(v) for v in boxes[i]], fp=fp, mode=parsing_mode)
         imwrite(os.path.join(masks_dir, f"{i:06d}.png"), mask)
-        crop_boxes.append(crop_box)
-        if i % 10 == 0:
-            progress(0.5 + 0.5 * i / n, f"计算融合遮罩 {i}/{n}")
+        crop_boxes[i] = crop_box
+
+    B = 4  # 每批 4 帧（8 张图）：更大的批次提速不明显，显存却会涨到 5GB 以上
+    with ThreadPoolExecutor(4) as pool:
+        futs = []
+        for s0 in range(0, n, B):
+            ids = list(range(s0, min(n, s0 + B)))
+            frames = [imread(os.path.join(frames_dir, f"{i:06d}.jpg")) for i in ids]
+            ins = []
+            for i, frame in zip(ids, frames):
+                x1, y1, x2, y2 = boxes[i]
+                crop = cv2.resize(frame[y1:y2, x1:x2], (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                rgb = torch.from_numpy(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).float().permute(2, 0, 1) / 255.0
+                ins += [norm(rgb * mask_t), norm(rgb)]
+                futs.append(pool.submit(mask_job, i, frame))
+            with torch.no_grad():
+                lat = vae.encode(torch.stack(ins).to(dev).half()).latent_dist.sample() * vae.config.scaling_factor
+            lat = lat.view(len(ids), 2, *lat.shape[1:])
+            lat_list.append(torch.cat([lat[:, 0], lat[:, 1]], dim=1).cpu())  # [k, 8, 32, 32]：半遮罩 + 参考
+            done = sum(f.done() for f in futs)
+            progress(0.5 + 0.5 * done / n, f"计算融合遮罩 {done}/{n}")
+        for f in futs:
+            f.result()  # 线程里的异常在这里抛出
     torch.save(torch.cat(lat_list), os.path.join(out_dir, "latents.pt"))
     np.savez(os.path.join(out_dir, "prep.npz"), boxes=boxes, crop_boxes=np.array(crop_boxes), valid=valid)
     lip = np.array(opens)

@@ -58,7 +58,49 @@ def _new_id(name):
     return f"{time.strftime('%Y%m%d_%H%M%S')}_{random.randint(100, 999)}"
 
 
-def create_video(name, src, start=None, end=None, on_progress=None, on_wait=None):
+def file_hash(path):
+    """素材指纹（大小 + 开头 8MB 的 SHA1），用于识别重复上传的同一个文件。"""
+    import hashlib
+    h = hashlib.sha1(str(os.path.getsize(path)).encode())
+    with open(path, "rb") as f:
+        h.update(f.read(8 << 20))
+    return h.hexdigest()[:20]
+
+
+def find_by_hash(h, kind):
+    """已经用同一个文件建立过、并且预处理完成的形象（设置里的形象分辨率变了则不复用）。"""
+    for m in all_avatars():
+        if m.get("source_hash") == h and m["kind"] == kind and m.get("ready")                 and (kind == "photo" or m.get("max_side") == config.settings()["max_side"]):
+            return m
+    return None
+
+
+MAX_AUTO_SEC = 120  # 工作流里太长的视频只取开头这么多秒作底片
+
+
+def ensure_video(src, on_progress=None, on_wait=None):
+    """工作流用：同一个视频文件只预处理一次。"""
+    h = file_hash(src)
+    m = find_by_hash(h, "video")
+    if m:
+        return m, False
+    dur = media.probe(src)["duration"]
+    name = os.path.splitext(os.path.basename(src))[0][:30]
+    m = create_video(name, src, None, MAX_AUTO_SEC if dur > MAX_AUTO_SEC else None, on_progress, on_wait,
+                     source_hash=h)
+    return m, True
+
+
+def ensure_photo(src, on_progress=None, on_wait=None):
+    h = file_hash(src)
+    m = find_by_hash(h, "photo")
+    if m:
+        return m, False
+    name = os.path.splitext(os.path.basename(src))[0][:30]
+    return create_photo(name, src, on_progress, on_wait, source_hash=h), True
+
+
+def create_video(name, src, start=None, end=None, on_progress=None, on_wait=None, source_hash=None):
     """从视频建立形象：标准化底片 → MuseTalk 预处理（检测人脸、计算遮罩与潜变量）。"""
     name = (name or "").strip() or "我的形象"
     aid = _new_id(name)
@@ -75,7 +117,8 @@ def create_video(name, src, start=None, end=None, on_progress=None, on_wait=None
         media.thumbnail(os.path.join(d, "source.mp4"), os.path.join(d, "cover.jpg"), min(1.0, info["duration"] / 2))
         meta = {"id": aid, "name": name, "kind": "video", "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "source_name": os.path.basename(src), "width": info["width"], "height": info["height"],
-                "duration": round(info["duration"], 2), "ready": False}
+                "duration": round(info["duration"], 2), "ready": False,
+                "source_hash": source_hash or file_hash(src), "max_side": config.settings()["max_side"]}
         _save(meta)
         prepare(aid, on_progress, on_wait)
         return load(aid)
@@ -97,8 +140,20 @@ def prepare(aid, on_progress=None, on_wait=None, extra_margin=10, parsing_mode="
     return meta
 
 
-def create_photo(name, src, on_progress=None, on_wait=None):
-    """照片形象：转正、限制尺寸后检测所有人脸；默认驱动最大的真人脸，合影时可在形象库里改选。"""
+def default_face(faces, w, h):
+    """默认驱动哪张脸：人脸面积 × 离画面中心的远近。只按大小选的话，景点照里常会选中背景的雕像 / 海报
+    （实测一张照片里最大的「脸」是雕像，本人在画面中间偏下）。"""
+    import math
+
+    def score(f):
+        x1, y1, x2, y2 = f["box"]
+        cx, cy = (x1 + x2) / 2 / w, (y1 + y2) / 2 / h
+        return (x2 - x1) * (y2 - y1) * math.exp(-((cx - 0.5) ** 2 + (cy - 0.45) ** 2) / 0.08)
+    return max(range(len(faces)), key=lambda i: score(faces[i])) if faces else 0
+
+
+def create_photo(name, src, on_progress=None, on_wait=None, source_hash=None):
+    """照片形象：转正、限制尺寸后检测所有人脸；默认按大小和位置选一张脸，合影时可在形象库里改选。"""
     name = (name or "").strip() or "我的照片形象"
     aid = _new_id(name)
     d = _dir(aid)
@@ -113,7 +168,7 @@ def create_photo(name, src, on_progress=None, on_wait=None):
             raise ValueError("照片里检测不到人脸，请换一张正脸清晰的照片")
         meta = {"id": aid, "name": name, "kind": "photo", "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "source_name": os.path.basename(src), "width": w, "height": h, "ready": True,
-                "faces": faces, "face": 0}
+                "faces": faces, "face": default_face(faces, w, h), "source_hash": source_hash or file_hash(src)}
         _save(meta)
         _photo_cover(load(aid))
         return load(aid)

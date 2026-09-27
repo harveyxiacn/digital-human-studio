@@ -56,6 +56,45 @@ def _face_cx(meta):
         return None
 
 
+def generate(av, wav, out, engine, opts=None, crf=18, refine=False, on_progress=None, on_refine=None, on_wait=None,
+             start_frame=0):
+    """形象 + 一段音频 → 口型视频 out（带这段音频）。返回引擎结果（sec、peak_vram_mb、next_frame 等）。
+    start_frame：视频形象从底片第几帧开始（工作流里同一个素材的多个镜头接着往下放，动作不重复）。"""
+    opts = opts or {}
+    if engine == "musetalk":
+        return engines.run("musetalk", {"cmd": "render", "avatar_dir": av["dir"], "audio": wav, "out": out,
+                                        "batch_size": int(opts.get("batch_size", 8)), "crf": crf,
+                                        "idle_original": opts.get("idle_original"), "start_frame": int(start_frame)},
+                           on_progress, on_wait=on_wait)
+    if engine == "latentsync":
+        return engines.run("latentsync", {"cmd": "render", "video": os.path.join(av["dir"], "source.mp4"),
+                                          "audio": wav, "out": out, "steps": int(opts.get("steps", 20)),
+                                          "guidance": float(opts.get("guidance", 1.5)),
+                                          "seed": int(opts.get("seed", 1247)), "crf": crf},
+                           on_progress, on_wait=on_wait)
+    raw = out if not refine else out + ".joyvasa.mp4"
+    res = engines.run("joyvasa", {"cmd": "render", "image": os.path.join(av["dir"], "photo.png"), "audio": wav,
+                                  "out": raw, "cfg_scale": float(opts.get("cfg_scale", 2.8)),
+                                  "expression": float(opts.get("expression", 1.0)),
+                                  "head_motion": float(opts.get("head_motion", 1.0)), "crf": crf,
+                                  "face_box": avatars.face_box(av),
+                                  "keep_expression": bool(opts.get("keep_expression", True)),
+                                  "max_dim": int(opts.get("max_dim", 1280))},
+                      on_progress, on_wait=on_wait)
+    if refine:  # 把 JoyVASA 的结果当作底片，再用 MuseTalk 重做嘴型
+        sp = on_refine or (lambda p, m="": None)
+        tmp_av = out + "_refine"
+        os.makedirs(tmp_av, exist_ok=True)
+        engines.run("musetalk", {"cmd": "prepare", "video": raw, "out_dir": tmp_av},
+                    lambda p, m: sp(p * 0.5, "口型精修：" + m), gpu_task="形象预处理", on_wait=on_wait)
+        engines.run("musetalk", {"cmd": "render", "avatar_dir": tmp_av, "audio": wav, "out": out,
+                                 "idle_original": False, "crf": crf},
+                    lambda p, m: sp(0.5 + p * 0.5, "口型精修：" + m), on_wait=on_wait)
+        shutil.rmtree(tmp_av, ignore_errors=True)
+        os.remove(raw)
+    return res
+
+
 def render(avatar_id, audio=None, take_id=None, engine=None, srt=None, subtitles=True, aspect="原始",
            bg_mode="原样", bg_color="#00B140", bg_image=None, refine=False, opts=None,
            on_progress=None, on_wait=None):
@@ -102,37 +141,8 @@ def render(avatar_id, audio=None, take_id=None, engine=None, srt=None, subtitles
         res = {}
 
         # ---- 口型
-        if engine == "musetalk":
-            res = engines.run("musetalk", {"cmd": "render", "avatar_dir": av["dir"], "audio": wav, "out": raw,
-                                           "batch_size": int(opts.get("batch_size", 8)), "crf": crf,
-                                           "idle_original": opts.get("idle_original")},
-                              stage("gen"), on_wait=on_wait)
-        elif engine == "latentsync":
-            res = engines.run("latentsync", {"cmd": "render", "video": os.path.join(av["dir"], "source.mp4"),
-                                             "audio": wav, "out": raw, "steps": int(opts.get("steps", 20)),
-                                             "guidance": float(opts.get("guidance", 1.5)),
-                                             "seed": int(opts.get("seed", 1247)), "crf": crf},
-                              stage("gen"), on_wait=on_wait)
-        else:
-            res = engines.run("joyvasa", {"cmd": "render", "image": os.path.join(av["dir"], "photo.png"), "audio": wav,
-                                          "out": raw, "cfg_scale": float(opts.get("cfg_scale", 2.8)),
-                                          "expression": float(opts.get("expression", 1.0)),
-                                          "head_motion": float(opts.get("head_motion", 1.0)), "crf": crf,
-                                          "face_box": avatars.face_box(av),
-                                          "keep_expression": bool(opts.get("keep_expression", True))},
-                              stage("gen"), on_wait=on_wait)
-            if refine:  # 把 JoyVASA 的结果当作底片，再用 MuseTalk 重做嘴型
-                tmp_av = os.path.join(d, "refine")
-                os.makedirs(tmp_av)
-                sp = stage("refine")
-                engines.run("musetalk", {"cmd": "prepare", "video": raw, "out_dir": tmp_av},
-                            lambda p, m: sp(p * 0.5, "口型精修：" + m), gpu_task="形象预处理", on_wait=on_wait)
-                raw2 = os.path.join(d, "raw_refined.mp4")
-                engines.run("musetalk", {"cmd": "render", "avatar_dir": tmp_av, "audio": wav, "out": raw2,
-                                         "idle_original": False, "crf": crf},
-                            lambda p, m: sp(0.5 + p * 0.5, "口型精修：" + m), on_wait=on_wait)
-                shutil.rmtree(tmp_av, ignore_errors=True)
-                raw = raw2
+        res = generate(av, wav, raw, engine, opts, crf, refine, stage("gen"),
+                       stage("refine") if plan["refine"] else None, on_wait)
 
         # ---- 背景
         cur = raw

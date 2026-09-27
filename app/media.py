@@ -129,7 +129,8 @@ def post(src, dst, aspect="原始", srt=None, font_size=0, bg=None, crf=18, face
         vf.append(f"crop={cw}:{ch}:{x}:{y}")
         w, h = cw, ch
     if srt:
-        size = font_size or max(12, round(h / 22 if h > w else h / 16))
+        # 竖屏按宽度算（一行 16 个字要放得下），横屏按高度算
+        size = font_size or max(12, round(min(h / 22 if h > w else h / 16, w * 0.9 / 17)))
         # libass 的字号以 PlayResY=288 为基准，这里换算成像素
         fs = round(size * 288 / h)
         style = (f"FontName=Microsoft YaHei,FontSize={fs},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
@@ -163,4 +164,102 @@ def srt_shift(src, dst, offset):
                   lambda m: f"{fmt(parse(m[1]) + offset)} --> {fmt(parse(m[2]) + offset)}", text)
     with open(dst, "w", encoding="utf-8") as f:
         f.write(text)
+    return dst
+
+
+# ---------------------------------------------------------------- 工作流用
+
+SR = 48000  # 拼接后的统一采样率
+
+
+def pcm16k(path):
+    """解码成 16kHz 单声道 float32（用于找停顿）。"""
+    import numpy as np
+    r = subprocess.run([config.ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", path, "-f", "s16le", "-ac", "1",
+                        "-ar", "16000", "-"], capture_output=True, creationflags=NOWIN)
+    if r.returncode != 0:
+        raise RuntimeError("读取音频失败：" + r.stderr.decode("utf-8", "replace")[-300:])
+    return np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32768
+
+
+def concat_audio(paths, dst, gap=0.3):
+    """按顺序拼接多段音频（统一成 48kHz 单声道），段间插入 gap 秒静音。返回每段的 (开始, 结束) 秒。"""
+    import numpy as np
+    pieces, spans, t = [], [], 0.0
+    for i, p in enumerate(paths):
+        r = subprocess.run([config.ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", p, "-f", "s16le", "-ac", "1",
+                            "-ar", str(SR), "-"], capture_output=True, creationflags=NOWIN)
+        if r.returncode != 0:
+            raise RuntimeError(f"读取音频失败：{os.path.basename(p)}")
+        y = np.frombuffer(r.stdout, np.int16)
+        spans.append((t, t + len(y) / SR))
+        pieces.append(y)
+        t += len(y) / SR
+        if gap and i < len(paths) - 1:
+            pieces.append(np.zeros(int(SR * gap), np.int16))
+            t += gap
+    import wave
+    with wave.open(dst, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(np.concatenate(pieces).tobytes())
+    return spans
+
+
+def cut_audio(src, dst, start, end):
+    ff(["-ss", f"{start:.3f}", "-i", src, "-t", f"{end - start:.3f}", "-c:a", "pcm_s16le", dst])
+    return dst
+
+
+def silence_points(y16k, min_gap=0.25, thresh_db=-40.0):
+    """停顿的中点（秒）：音量低于阈值且持续 ≥ min_gap 秒的区间。"""
+    import numpy as np
+    hop = 160  # 10ms
+    n = len(y16k) // hop
+    if n == 0:
+        return []
+    rms = np.sqrt(np.mean(y16k[:n * hop].reshape(n, hop) ** 2, axis=1) + 1e-10)
+    db = 20 * np.log10(rms / (np.percentile(rms, 95) + 1e-9) + 1e-10)
+    quiet = db < thresh_db
+    out, i = [], 0
+    while i < n:
+        if quiet[i]:
+            j = i
+            while j < n and quiet[j]:
+                j += 1
+            if (j - i) * 0.01 >= min_gap:
+                out.append((i + j) / 2 * 0.01)
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def fit_frames(src, dst, w, h, frames, face=None, fps=25):
+    """把一段视频按「铺满后裁切」缩放到 w×h，并精确输出 frames 帧（不够时重复最后一帧），不带声音。
+    face：人脸中心 (x, y)，相对源画面 0~1；裁切时让脸落在水平居中、距顶部约 35% 的位置。"""
+    info = probe(src)
+    sw, sh = info["width"], info["height"]
+    k = max(w / sw, h / sh)
+    tw, th = _even(sw * k + 1), _even(sh * k + 1)
+    fx, fy = face if face else (0.5, 0.4)
+    x = int(min(max(0, fx * tw - w / 2), tw - w))
+    y = int(min(max(0, fy * th - h * 0.35), th - h))
+    ff(["-i", src, "-an", "-vf", f"fps={fps},scale={tw}:{th}:flags=lanczos,crop={w}:{h}:{x}:{y},"
+        f"tpad=stop_mode=clone:stop_duration=2", "-frames:v", str(frames), "-c:v", "libx264", "-crf", "16",
+        "-preset", "fast", "-pix_fmt", "yuv420p", dst])
+    return dst
+
+
+def concat_videos(paths, audio, dst, crf=18):
+    """拼接（同尺寸同编码的）无声视频片段，再混入整段音频。"""
+    lst = dst + ".txt"
+    with open(lst, "w", encoding="utf-8") as f:
+        for p in paths:
+            f.write("file '" + p.replace("\\", "/").replace("'", "'\''") + "'\n")
+    ff(["-f", "concat", "-safe", "0", "-i", lst, "-i", audio, "-map", "0:v", "-map", "1:a", "-c:v", "libx264",
+        "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest",
+        "-movflags", "+faststart", dst])
+    os.remove(lst)
     return dst

@@ -8,6 +8,9 @@
                     [--aspect 竖屏9:16] [--bg 绿幕] [--refine] [--jianying]
   python app/cli.py render 形象ID --take 声音工坊作品ID ...
   python app/cli.py takes                                 列出声音工坊作品
+  python app/cli.py workflow 素材1.mp4 照片.jpg 配音1.wav 配音2.wav [配音1.srt]
+                    [--mode mix|per_material|per_audio] [--aspect 竖屏9:16] [--subs auto|srt|none] [--hq] [--jianying]
+                    一键工作流：素材里的人说出这些音频（文件按扩展名自动归类，按文件名排序）
 """
 import argparse
 import os
@@ -20,6 +23,7 @@ import jianying  # noqa: E402
 import media  # noqa: E402
 import render as R  # noqa: E402
 import voice_bridge as VB  # noqa: E402
+import workflow as WF  # noqa: E402
 
 
 def bar(p, msg=""):
@@ -64,6 +68,17 @@ def main():
     a.add_argument("--expr", type=float, default=1.0)
     a.add_argument("--official-lip", action="store_true", help="照片形象：不保留原表情（先合嘴再驱动）")
     a.add_argument("--jianying", action="store_true", help="同时导出剪映草稿")
+    a = sub.add_parser("workflow")
+    a.add_argument("files", nargs="+")
+    a.add_argument("--mode", default="mix", choices=["mix", "per_material", "per_audio"])
+    a.add_argument("--aspect", default="竖屏9:16", help="原始 / 竖屏9:16 / 横屏16:9 / 方形1:1")
+    a.add_argument("--subs", default="auto", choices=["auto", "srt", "none"])
+    a.add_argument("--no-burn", action="store_true", help="不烧录字幕，只输出 .srt")
+    a.add_argument("--shot", type=float, default=6.0, help="多个素材时每个镜头大约几秒")
+    a.add_argument("--hq", action="store_true", help="视频素材用 LatentSync（慢约 6 倍）")
+    a.add_argument("--bg", default="原样")
+    a.add_argument("--no-sort", action="store_true", help="按命令行顺序，不按文件名排序")
+    a.add_argument("--jianying", action="store_true")
     args = ap.parse_args()
 
     if args.cmd == "avatars":
@@ -78,6 +93,23 @@ def main():
     elif args.cmd == "add-photo":
         m = avatars.create_photo(args.name, args.image)
         print(f"已建立：{m['id']}")
+    elif args.cmd == "workflow":
+        import re
+        mats, auds, srts, bad = WF.classify(args.files)
+        if bad:
+            print("忽略不支持的文件：" + "、".join(bad))
+        if not args.no_sort:
+            nat = lambda p: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", os.path.basename(p).lower())]
+            mats.sort(key=lambda m: nat(m[0]))
+            auds.sort(key=nat)
+        aspect = next((k for k in ["原始"] + list(WF.SIZES) if k.replace(" ", "") == args.aspect.replace(" ", "")), "原始")
+        bg = next((k for k in R.BG_MODES if k.startswith(args.bg)), "原样")
+        rs = WF.run(mats, auds, srts, mode=args.mode, quality="hq" if args.hq else "fast", shot_len=args.shot,
+                    subs=args.subs, burn_subs=not args.no_burn, aspect=aspect, bg_mode=bg, on_progress=bar, on_wait=wait)
+        print("\n" + WF.summary(rs).replace("**", "").replace("`", ""))
+        if args.jianying:
+            for m in rs:
+                print("剪映草稿：" + jianying.export(m))
     elif args.cmd == "render":
         aspect = next((k for k in media.ASPECTS if k.replace(" ", "") == args.aspect.replace(" ", "")), "原始")
         bg = next((k for k in R.BG_MODES if k.startswith(args.bg)), "原样")

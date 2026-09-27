@@ -31,7 +31,7 @@ HEAVY_APPS = {
     "photoshop.exe": "Photoshop", "blender.exe": "Blender",
 }
 # 各任务大约需要的空闲显存（MB）：RTX 3070 Laptop 8GB 实测峰值 + 余量，见设计说明
-NEED_MB = {"形象预处理": 3000, "MuseTalk": 4000, "LatentSync": 7000, "JoyVASA": 4000, "背景处理": 1500, "人脸检测": 1500}
+NEED_MB = {"形象预处理": 3000, "MuseTalk": 4000, "LatentSync": 7000, "JoyVASA": 4000, "背景处理": 1500, "人脸检测": 1500, "语音识别": 2000}
 
 
 class GpuBusy(RuntimeError):

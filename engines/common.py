@@ -165,27 +165,71 @@ def imwrite(path, img, params=None):
     buf.tofile(path)
 
 
+class FaceTracker:
+    """逐帧 68 点关键点，带跟踪：每 redetect 帧做一次完整人脸检测（最慢的一步），
+    中间帧沿用上次的检测框、按关键点重心的位移平移过去。实测比逐帧检测快约 3 倍，
+    脸移动太快（重心位移超过脸宽 15%）时立即重新检测。"""
+
+    def __init__(self, redetect=8):
+        self.redetect = redetect
+        self.n = 0
+        self.box = None       # 上次完整检测得到的人脸框（原图坐标）
+        self.box_c = None     # 检测时关键点的重心
+        self.prev_c = None
+
+    def __call__(self, img_bgr):
+        import numpy as np
+        need = self.box is None or self.n % self.redetect == 0
+        self.n += 1
+        if not need:
+            shift = self.prev_c - self.box_c
+            box = self.box + np.array([shift[0], shift[1], shift[0], shift[1]])
+            lm = _landmarks_in_box(img_bgr, box)
+            if lm is not None:
+                c = lm.mean(0)
+                if np.linalg.norm(c - self.prev_c) < 0.15 * (box[2] - box[0]):
+                    self.prev_c = c
+                    return lm, box
+        lm, box = face_landmarks(img_bgr)
+        if lm is None:
+            self.box = None
+            return None, None
+        self.box, self.box_c = box, lm.mean(0)
+        self.prev_c = self.box_c
+        return lm, box
+
+
+def _landmarks_in_box(img_bgr, box):
+    import numpy as np
+    _init_fa()
+    lms = _fa.get_landmarks_from_image(img_bgr[:, :, ::-1].copy(), detected_faces=[list(box)])
+    return np.asarray(lms[0][:, :2]) if lms else None
+
+
 _fa = None
+
+
+def _init_fa():
+    global _fa
+    if _fa is None:
+        import face_alignment
+        lt = getattr(face_alignment.LandmarksType, "TWO_D", None) or face_alignment.LandmarksType._2D
+        _fa = face_alignment.FaceAlignment(lt, flip_input=False, device="cuda", face_detector="sfd")
 
 
 def face_landmarks(img_bgr):
     """68 点人脸关键点（iBUG 顺序，原图坐标）和人脸框；检测不到返回 (None, None)。多人时取最大的脸。"""
-    global _fa
+    import cv2
     import numpy as np
-    import face_alignment
-    if _fa is None:
-        lt = getattr(face_alignment.LandmarksType, "TWO_D", None) or face_alignment.LandmarksType._2D
-        _fa = face_alignment.FaceAlignment(lt, flip_input=False, device="cuda", face_detector="sfd")
+    _init_fa()
     h, w = img_bgr.shape[:2]
     scale = min(1.0, 960 / max(h, w))  # 检测在缩小图上做，速度快很多
-    small = img_bgr if scale == 1.0 else __import__("cv2").resize(img_bgr, (int(w * scale), int(h * scale)))
-    rgb = small[:, :, ::-1].copy()
-    dets = _fa.face_detector.detect_from_image(rgb)
+    small = img_bgr if scale == 1.0 else cv2.resize(img_bgr, (int(w * scale), int(h * scale)))
+    dets = _fa.face_detector.detect_from_image(small[:, :, ::-1].copy())
     dets = [d for d in dets if d[4] > 0.8]
     if not dets:
         return None, None
     d = max(dets, key=lambda d: (d[2] - d[0]) * (d[3] - d[1]))
-    lms = _fa.get_landmarks_from_image(rgb, detected_faces=[d[:4]])
-    if not lms:
-        return None, None
-    return np.asarray(lms[0][:, :2]) / scale, np.asarray(d[:4]) / scale
+    box = np.asarray(d[:4]) / scale
+    lm = _landmarks_in_box(img_bgr, box)
+    return (lm, box) if lm is not None else (None, None)

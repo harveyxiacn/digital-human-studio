@@ -14,6 +14,7 @@ import gpu  # noqa: E402
 import jianying  # noqa: E402
 import render as R  # noqa: E402
 import voice_bridge as VB  # noqa: E402
+import workflow as WF  # noqa: E402
 
 AUDIO_SRC = ["上传音频", "声音工坊作品", "文字 → 声音工坊朗读"]
 TIPS = """**拍摄建议（视频形象）**
@@ -256,6 +257,99 @@ def on_export(rid):
     return f"✅ 已导出剪映草稿：`{p}`\n\n打开剪映（如果已经开着，请重启一次）就能在草稿列表里看到。"
 
 
+
+# ---------------------------------------------------------------- 一键生成（工作流）
+
+def _paths(files):
+    return [f if isinstance(f, str) else getattr(f, "name", None) or f.get("path") for f in (files or [])]
+
+
+def _natural(p):
+    import re
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", os.path.basename(p).lower())]
+
+
+def _split_uploads(mat_files, aud_files, sort_names):
+    """两个上传框里的文件按类型归类（放错框也没关系）。"""
+    mats, auds, srts, bad = WF.classify(_paths(mat_files) + _paths(aud_files))
+    if sort_names:
+        mats.sort(key=lambda m: _natural(m[0]))
+        auds.sort(key=_natural)
+    return mats, auds, srts, bad
+
+
+def on_wf_check(mat_files, aud_files, sort_names, progress=gr.Progress()):
+    mats, auds, srts, bad = _split_uploads(mat_files, aud_files, sort_names)
+    if not mats:
+        raise gr.Error("请上传至少一个视频或图片素材")
+    try:
+        items = WF.analyze(mats, _progress_cb(progress), _wait_cb(progress))
+    except Exception as e:
+        _err(e)
+    gallery = [(it["preview"], f"{i + 1}. {it['name']}") for i, it in enumerate(items)]
+    rows = [[i + 1, it["name"], "视频" if it["kind"] == "video" else "图片", it["note"],
+             str(it["face"] + 1) if it["kind"] == "photo" else ""] for i, it in enumerate(items)]
+    lines = [f"素材 {len(mats)} 个，音频 {len(auds)} 段" + (f"，字幕 {len(srts)} 个" if srts else "")]
+    if auds:
+        lines.append("音频顺序：" + " → ".join(os.path.basename(a) for a in auds))
+    if bad:
+        lines.append("⚠️ 不支持、已忽略：" + "、".join(bad))
+    if any(it["kind"] == "photo" and len(it["faces"]) > 1 for it in items):
+        lines.append("图片里有多张脸：绿框是默认要驱动的人；不对的话把表格里的「人脸编号」改成图上的编号")
+    return gallery, rows, "\n\n".join(lines), items
+
+
+def on_wf_run(mat_files, aud_files, sort_names, items, faces_df, mode, quality, aspect, subs, burn, shot_len,
+              per_audio, bg_mode, bg_color, bg_image, keep, head, expr, progress=gr.Progress()):
+    mats, auds, srts, _ = _split_uploads(mat_files, aud_files, sort_names)
+    if not mats:
+        raise gr.Error("请上传至少一个视频或图片素材")
+    if not auds:
+        raise gr.Error("请上传至少一段音频")
+    # 表格里改过的人脸编号（只认本次检查过的同一批素材）
+    face_choice = {}
+    rows = faces_df.values.tolist() if hasattr(faces_df, "values") else (faces_df or [])
+    if items and [it["path"] for it in items] == [m[0] for m in mats]:
+        for it, row in zip(items, rows):
+            if it["kind"] != "photo" or not str(row[4]).strip():
+                continue
+            try:
+                k = int(float(row[4])) - 1
+            except ValueError:
+                raise gr.Error(f"{it['name']}：人脸编号请填数字")
+            if not 0 <= k < len(it["faces"]):
+                raise gr.Error(f"{it['name']}：人脸编号应在 1~{len(it['faces'])} 之间")
+            face_choice[it["path"]] = k
+    try:
+        rs = WF.run(mats, auds, srts, mode=WF.MODES[mode], quality=WF.QUALITY[quality], shot_len=shot_len,
+                    per_audio_shot=per_audio, subs=WF.SUBS[subs], burn_subs=burn, aspect=aspect, bg_mode=bg_mode,
+                    bg_color=bg_color, bg_image=bg_image, face_choice=face_choice,
+                    opts={"keep_expression": keep, "head_motion": head, "expression": expr},
+                    on_progress=_progress_cb(progress), on_wait=_wait_cb(progress))
+    except gr.Error:
+        raise
+    except Exception as e:
+        _err(e)
+    files = [r["out"] for r in rs] + [r["srt"] for r in rs if r.get("srt")]
+    first = next((r["out"] for r in rs if r["out"].endswith(".mp4")), None)
+    return first, files, WF.summary(rs), [r["id"] for r in rs], history_md()
+
+
+def on_wf_export(ids):
+    if not ids:
+        raise gr.Error("请先生成视频")
+    hs = {h["id"]: h for h in R.history(500)}
+    out = []
+    try:
+        for rid in ids:
+            if rid in hs:
+                out.append(jianying.export(hs[rid]))
+    except Exception as e:
+        _err(e)
+    return (f"✅ 已导出 {len(out)} 个剪映草稿：\n\n" + "\n\n".join(f"`{p}`" for p in out)
+            + "\n\n打开剪映（已经开着的话重启一次）就能在草稿列表里看到。")
+
+
 # ---------------------------------------------------------------- 设置
 
 def on_save_settings(vs, dr, max_side, crf):
@@ -281,7 +375,57 @@ def build():
         gpu_bar = gr.Markdown(gpu_md(), elem_id="gpu-bar")
         rid_state = gr.State(None)
 
-        with gr.Tab("🎬 生成"):
+        with gr.Tab("⚡ 一键生成"):
+            gr.Markdown("上传人物的**视频或图片**（一个或多个）和**声音文件**（一段或多段），生成素材里的人说出这些声音的数字人视频。"
+                        "同名的 `.srt` 字幕会自动对应到音频；没有字幕时可以调用声音工坊自动识别。")
+            wf_items = gr.State([])
+            wf_ids = gr.State([])
+            with gr.Row():
+                with gr.Column(scale=1):
+                    wf_mats = gr.File(label="① 人物素材：视频 / 图片（可多选）", file_count="multiple",
+                                      file_types=sorted(WF.VIDEO_EXT | WF.IMAGE_EXT), height=170, elem_id="wf-mats")
+                    wf_auds = gr.File(label="② 声音：音频（可多段，按顺序拼接）+ 可选同名 .srt 字幕",
+                                      file_count="multiple", file_types=sorted(WF.AUDIO_EXT | {".srt"}), height=170, elem_id="wf-auds")
+                    wf_sort = gr.Checkbox(value=True, label="按文件名排序（第1段、第2段…）；不勾选则按上传顺序")
+                    wf_check = gr.Button("🔍 检查素材（可选：看人脸、改选要说话的人）")
+                    wf_info = gr.Markdown()
+                with gr.Column(scale=1):
+                    wf_gallery = gr.Gallery(label="素材预览（图片上的绿框 = 要让谁说话）", columns=3, height=260,
+                                            object_fit="contain")
+                    wf_table = gr.Dataframe(headers=["序号", "文件", "类型", "说明", "人脸编号"], interactive=True,
+                                            datatype=["number", "str", "str", "str", "str"], wrap=True,
+                                            label="素材清单（图片的「人脸编号」可以改）")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    wf_mode = gr.Radio(list(WF.MODES), value=list(WF.MODES)[0], label="③ 输出方式")
+                    wf_quality = gr.Radio(list(WF.QUALITY), value=list(WF.QUALITY)[0], label="画质 / 速度")
+                    wf_shot = gr.Slider(3, 20, 6, step=1, label="多个素材时，每个镜头大约几秒（在句子之间切换）")
+                    wf_peraud = gr.Checkbox(value=True, label="多个素材 + 多段音频时，每段音频一个镜头")
+                with gr.Column(scale=1):
+                    wf_aspect = gr.Radio(["原始", "竖屏 9:16", "横屏 16:9", "方形 1:1"], value="竖屏 9:16",
+                                         label="④ 画幅（按人脸位置自动裁切）")
+                    wf_subs = gr.Radio(list(WF.SUBS), label="字幕",
+                                       value=list(WF.SUBS)[0] if WF.SUB.asr_available() else list(WF.SUBS)[1])
+                    wf_burn = gr.Checkbox(value=True, label="把字幕烧录进画面（不勾选则只输出 .srt；导出剪映草稿时是可编辑字幕）")
+                    wf_bg = gr.Radio(list(R.BG_MODES), value="原样", label="背景")
+                    with gr.Accordion("背景颜色 / 图片、照片参数", open=False):
+                        with gr.Row():
+                            wf_bgc = gr.ColorPicker(value="#00B140", label="纯色背景颜色")
+                            wf_bgi = gr.Image(label="背景图片", type="filepath", height=120)
+                        wf_keep = gr.Checkbox(value=True, label="照片：保留原有表情（笑脸照一定要开）")
+                        wf_head = gr.Slider(0.0, 1.5, 1.0, step=0.05, label="照片：头部动作幅度")
+                        wf_expr = gr.Slider(0.5, 1.5, 1.0, step=0.05, label="照片：表情幅度")
+            wf_go = gr.Button("⚡ 一键生成", variant="primary", size="lg")
+            with gr.Row():
+                with gr.Column(scale=3):
+                    wf_video = gr.Video(label="成片（多条时显示第一条，全部在右侧下载）", height=520)
+                with gr.Column(scale=2):
+                    wf_sum = gr.Markdown()
+                    wf_files = gr.Files(label="下载全部成片和字幕")
+                    wf_exp = gr.Button("📤 全部导出为剪映草稿")
+                    wf_exp_msg = gr.Markdown()
+
+        with gr.Tab("🎬 单条生成"):
             with gr.Row():
                 with gr.Column(scale=4):
                     g_avatar = gr.Dropdown(label="① 选择形象", choices=avatars.choices(), interactive=True,
@@ -398,6 +542,12 @@ def build():
             st_msg = gr.Markdown()
 
         # ---- 事件
+        wf_check.click(on_wf_check, [wf_mats, wf_auds, wf_sort], [wf_gallery, wf_table, wf_info, wf_items],
+                       concurrency_limit=1)
+        wf_go.click(on_wf_run, [wf_mats, wf_auds, wf_sort, wf_items, wf_table, wf_mode, wf_quality, wf_aspect, wf_subs,
+                                wf_burn, wf_shot, wf_peraud, wf_bg, wf_bgc, wf_bgi, wf_keep, wf_head, wf_expr],
+                    [wf_video, wf_files, wf_sum, wf_ids, g_hist], concurrency_limit=1)
+        wf_exp.click(on_wf_export, wf_ids, wf_exp_msg)
         g_avatar.change(on_pick_avatar, g_avatar, [g_cover, g_info, g_engine, g_refine])
         g_src.change(on_audio_src, g_src, [grp_up, grp_take, grp_tts])
         g_take_ref.click(on_refresh_takes, None, g_take)
@@ -430,4 +580,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("DH_PORT", "7870"))
     build().queue(default_concurrency_limit=4).launch(
         server_name="127.0.0.1", server_port=port, inbrowser="--no-browser" not in sys.argv,
-        allowed_paths=[config.OUTPUTS, config.AVATARS, config.voice_studio_dir() or config.OUTPUTS])
+        allowed_paths=[config.OUTPUTS, config.WORK, config.voice_studio_dir() or config.OUTPUTS])
