@@ -110,6 +110,16 @@ class Worker:
 _workers = {n: Worker(n) for n in WORKERS}
 
 
+def loaded():
+    """本进程里已加载（占显存）的引擎。"""
+    return [GPU_TASK[n] for n, w in _workers.items() if w.alive()]
+
+
+def busy():
+    """本进程是否有引擎正在执行任务。"""
+    return any(w.lock.locked() for w in _workers.values())
+
+
 def release_all(keep=None):
     for n, w in _workers.items():
         if n != keep:

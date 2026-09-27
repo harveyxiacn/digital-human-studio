@@ -51,11 +51,42 @@ def gpu_md():
     t = f"🖥️ {s['name']}　显存 {s['used'] / 1024:.1f} / {s['total'] / 1024:.0f} GB"
     if s["task"]:
         t += f"　|　正在运行：{s['task']}"
+    ld = engines.loaded()
+    if ld:
+        t += f"　|　已加载：{'、'.join(ld)}（空闲 {engines.IDLE_SEC} 秒后自动释放）"
     if s["queue"]:
         t += f"　|　排队 {len(s['queue'])} 个"
     if s["apps"]:
         t += f"　|　⚠️ {'、'.join(s['apps'])} 正在占用显存，生成前请关闭"
     return t
+
+
+def on_release():
+    """释放显存：关掉本网页加载的空闲引擎，并请求命令行等其他数字人工坊进程释放它们的空闲引擎。"""
+    if engines.busy():
+        gr.Warning("有任务正在使用显卡，暂时不能释放（等它完成，或刷新页面后再试）")
+        return gpu_md()
+    before = config.gpu_info()[2]
+    names = engines.loaded()
+    engines.release_all()
+    gpu.request_release()
+    import time
+    time.sleep(2)
+    after = config.gpu_info()[2]
+    freed = max(0, before - after)
+    msg = (f"已释放：{'、'.join(names)}" if names else "本网页没有加载引擎") + f"，显存减少 {freed / 1024:.1f}GB"
+    h = gpu.holder()
+    if h and not str(h.get("task", "")).startswith("数字人"):
+        msg += f"。显卡还被「{h.get('task')}」占用（来自声音工坊），可以在声音工坊里点「释放显存」"
+    gr.Info(msg)
+    return gpu_md()
+
+
+def on_cancel_queue():
+    n = sum(1 for q in gpu.queue() if q["pid"] == os.getpid())
+    gpu.cancel()
+    gr.Info(f"已取消 {n} 个排队中的任务" if n else "没有排队中的任务")
+    return gpu_md()
 
 
 def engines_md():
@@ -372,7 +403,12 @@ def build():
     s = config.settings()
     with gr.Blocks(title="数字人工坊", css=CSS, theme=gr.themes.Soft()) as demo:
         gr.Markdown("# 🧑‍💼 数字人工坊\n用自己的视频或照片 + 自己的声音，在本机生成口型同步的数字人视频")
-        gpu_bar = gr.Markdown(gpu_md(), elem_id="gpu-bar")
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=6):
+                gpu_bar = gr.Markdown(gpu_md(), elem_id="gpu-bar")
+            with gr.Column(scale=1, min_width=120):
+                release_btn = gr.Button("🧹 释放显存", size="sm")
+                cancel_q_btn = gr.Button("取消排队", size="sm")
         rid_state = gr.State(None)
 
         with gr.Tab("⚡ 一键生成"):
@@ -570,6 +606,8 @@ def build():
 
         st_btn.click(on_save_settings, [st_vs, st_dr, st_max, st_crf], [st_msg, e_md])
         gr.Timer(5).tick(gpu_md, None, gpu_bar)
+        release_btn.click(on_release, None, gpu_bar)
+        cancel_q_btn.click(on_cancel_queue, None, gpu_bar)
         demo.load(on_pick_avatar, g_avatar, [g_cover, g_info, g_engine, g_refine])
         demo.load(on_pick_take, g_take, [g_take_audio, g_take_info])
         demo.load(on_pick_manage, a_pick, [a_info, a_pv, a_pp, a_name, a_face])
